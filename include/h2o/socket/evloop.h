@@ -24,6 +24,7 @@
 
 #include "h2o/linklist.h"
 #include "h2o/timerwheel.h"
+#include "rapido.h"
 
 #define H2O_SOCKET_FLAG_IS_DISPOSED 0x1
 #define H2O_SOCKET_FLAG_IS_READ_READY 0x2
@@ -47,6 +48,7 @@ typedef struct st_h2o_evloop_t {
     struct timeval _tv_at;
     h2o_timerwheel_t *_timeouts;
     h2o_sliding_counter_t exec_time_nanosec_counter;
+    rapido_server_t *server;
 } h2o_evloop_t;
 
 typedef h2o_evloop_t h2o_loop_t;

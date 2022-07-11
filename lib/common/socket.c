@@ -34,9 +34,9 @@
 #if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
 #include <sys/ioctl.h>
 #endif
-#include "picotls.h"
 #include "h2o/socket.h"
 #include "h2o/multithread.h"
+#include "rapido.h"
 
 #if defined(__APPLE__) && defined(__clang__)
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -66,6 +66,15 @@ struct st_h2o_socket_ssl_t {
     SSL_CTX *ssl_ctx;
     SSL *ossl;
     ptls_t *ptls;
+    struct {
+        enum {
+            rapido_not_used,
+            rapido_handshake_pending,
+            rapido_handshake_done
+        } status;
+        rapido_session_t *session;
+        rapido_connection_id_t connection_id;
+    } rapido;
     int *did_write_in_read; /* used for detecting and closing the connection upon renegotiation (FIXME implement renegotiation) */
     size_t record_overhead;
     struct {
@@ -117,6 +126,7 @@ static socklen_t get_sockname_uncached(h2o_socket_t *sock, struct sockaddr *sa);
 
 /* internal functions called from the backend */
 static const char *decode_ssl_input(h2o_socket_t *sock);
+static const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time);
 static void on_write_complete(h2o_socket_t *sock, const char *err);
 
 #if H2O_USE_LIBUV
@@ -295,6 +305,48 @@ const char *decode_ssl_input(h2o_socket_t *sock)
     return 0;
 }
 
+const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
+    assert(sock->ssl != NULL);
+    assert(sock->ssl->rapido.status == rapido_handshake_done);
+    assert(sock->ssl->handshake.cb == NULL);
+
+    rapido_server_t *server = h2o_socket_get_loop(sock)->server;
+
+    if (sock->ssl->rapido.session != NULL) {
+        if (sock->ssl->input.encrypted->size != 0) {
+            const char *src = sock->ssl->input.encrypted->bytes, *src_end = src + sock->ssl->input.encrypted->size;
+            h2o_iovec_t reserved;
+            size_t consumed = src_end - src;
+            rapido_session_t *session = sock->ssl->rapido.session;
+
+            if (sock->ssl->rapido.status == rapido_handshake_done) {
+                rapido_process_incoming_data(session, sock->ssl->rapido.connection_id, current_time, (uint8_t *) src, &consumed);
+                src += consumed;
+                h2o_buffer_consume(&sock->ssl->input.encrypted, sock->ssl->input.encrypted->size - (src_end - src));
+            }           
+
+            rapido_application_notification_t *notification = NULL;
+            while (session->pending_notifications.size > 0) {
+                notification = (rapido_application_notification_t *) rapido_queue_pop(&session->pending_notifications);
+                if (notification->notification_type == rapido_stream_has_data) {
+                    size_t read_len = UINT64_MAX;
+                    uint8_t *stream_data = rapido_read_stream(session, notification->stream_id, &read_len);
+                    if (read_len > 0) {
+                        if ((reserved = h2o_buffer_try_reserve(&sock->input, read_len)).base == NULL)
+                            return h2o_socket_error_out_of_memory;
+                        memcpy(reserved.base, stream_data, read_len);
+                        sock->input->size += read_len;
+                    }
+                }
+            }
+            // TODO(mp): Handle decode error
+        }
+        return NULL;
+    }
+
+    return 0;
+}
+
 static void flush_pending_ssl(h2o_socket_t *sock, h2o_socket_cb cb)
 {
     do_write(sock, sock->ssl->output.bufs.entries, sock->ssl->output.bufs.size, cb);
@@ -308,7 +360,14 @@ static void clear_output_buffer(struct st_h2o_socket_ssl_t *ssl)
 
 static void destroy_ssl(struct st_h2o_socket_ssl_t *ssl)
 {
-    if (ssl->ptls != NULL) {
+    if (ssl->rapido.session != NULL) {
+        rapido_array_iter(&ssl->rapido.session->connections, i, rapido_connection_t *connection, {
+            connection->socket = -1;
+        });
+        rapido_session_free(ssl->rapido.session);
+        ssl->rapido.session = NULL;
+        ssl->ptls = NULL;
+    } else if (ssl->ptls != NULL) {
         ptls_free(ssl->ptls);
         ssl->ptls = NULL;
     }
@@ -665,7 +724,17 @@ void h2o_socket_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_
             while (off != bufs[0].len) {
                 int ret;
                 size_t sz = calc_tls_write_size(sock, bufs[0].len - off);
-                if (sock->ssl->ptls != NULL) {
+                if (sock->ssl->rapido.status == rapido_handshake_done) {
+                    // bufs[0].base + off, sz
+                    rapido_attach_stream(sock->ssl->rapido.session, 0, 0);
+                    rapido_add_to_stream(sock->ssl->rapido.session, 0, bufs[0].base + off, sz);
+                    // TODO(mp): Make a smarter guess on what buffer size is required to send sz bytes
+                    size_t dst_size = 16384 + (2 * sz);
+                    void *dst = h2o_mem_alloc_pool(&sock->ssl->output.pool, char, dst_size);
+                    rapido_prepare_data(sock->ssl->rapido.session, sock->ssl->rapido.connection_id, h2o_now(h2o_socket_get_loop(sock)), dst, &dst_size);
+                    h2o_vector_reserve(&sock->ssl->output.pool, &sock->ssl->output.bufs, sock->ssl->output.bufs.size + 1);
+                    sock->ssl->output.bufs.entries[sock->ssl->output.bufs.size++] = h2o_iovec_init(dst, dst_size);
+                } else if (sock->ssl->ptls != NULL) {
                     size_t dst_size = sz + ptls_get_record_overhead(sock->ssl->ptls);
                     void *dst = h2o_mem_alloc_pool(&sock->ssl->output.pool, char, dst_size);
                     ptls_buffer_t wbuf;
@@ -772,6 +841,8 @@ ptls_t *h2o_socket_get_ptls(h2o_socket_t *sock)
 const char *h2o_socket_get_ssl_protocol_version(h2o_socket_t *sock)
 {
     if (sock->ssl != NULL) {
+        if (sock->ssl->rapido.status > rapido_not_used)
+            return "TCPLS";
         if (sock->ssl->ptls != NULL)
             return "TLSv1.3";
         if (sock->ssl->ossl != NULL)
@@ -1143,8 +1214,13 @@ static void on_handshake_complete(h2o_socket_t *sock, const char *err)
     h2o_socket_cb handshake_cb = sock->ssl->handshake.cb;
     sock->_cb.write = NULL;
     sock->ssl->handshake.cb = NULL;
-    if (err == NULL)
-        err = decode_ssl_input(sock);
+    if (err == NULL) {
+        if (sock->ssl->rapido.status > rapido_not_used) {
+            err = decode_tcpls_input(sock, h2o_now(h2o_socket_get_loop(sock)));
+        } else {
+            err = decode_ssl_input(sock);
+        }
+    }
     handshake_cb(sock, err);
 }
 
@@ -1154,6 +1230,56 @@ static void on_handshake_fail_complete(h2o_socket_t *sock, const char *err)
 }
 
 static void proceed_handshake(h2o_socket_t *sock, const char *err);
+
+static void proceed_handshake_tcpls(h2o_socket_t *sock) 
+{
+    assert(sock->ssl->rapido.status == rapido_handshake_pending);
+    const char *src = sock->ssl->input.encrypted->bytes, *src_end = src + sock->ssl->input.encrypted->size;
+    size_t consumed = sock->ssl->input.encrypted->size;
+    ptls_buffer_t wbuf;
+    ptls_buffer_init(&wbuf, "", 0);
+
+    rapido_server_t *server = h2o_socket_get_loop(sock)->server;
+    
+    rapido_session_t *session = sock->ssl->rapido.session;
+    rapido_connection_t *connection = NULL;
+    rapido_server_process_handshake(server, NULL, &server->pending_connections, 0 /* TODO pending_connection_index*/, (uint8_t *) src, &consumed, &wbuf, &session, &connection);
+    if (wbuf.off > 0) {
+        h2o_socket_read_stop(sock);
+        write_ssl_bytes(sock, wbuf.base, wbuf.off);
+    }
+    ptls_buffer_dispose(&wbuf);
+    if (session) {
+        sock->ssl->rapido.session = session;
+    }
+    if (session != NULL && ptls_handshake_is_complete(session->tls)) {
+        sock->ssl->rapido.status = rapido_handshake_done;
+    }
+    if (connection) {
+        sock->ssl->rapido.connection_id = connection->connection_id;
+    }
+    src += consumed;
+    h2o_buffer_consume(&sock->ssl->input.encrypted, sock->ssl->input.encrypted->size - (src_end - src));
+
+    h2o_socket_cb next_cb;
+    if (sock->ssl->rapido.status == rapido_handshake_done) {
+        next_cb = on_handshake_complete;
+    } else {
+        next_cb = proceed_handshake;
+    }
+    //TODO(mp): Handle failure
+    int ret = 0;
+
+    /* When something is to be sent, send it and then take the next action. If there's nothing to be sent and the handshake is still
+     * in progress, wait for more bytes to arrive; otherwise, take the action immediately. */
+    if (wbuf.off != 0) {
+        h2o_socket_read_stop(sock);
+        write_ssl_bytes(sock, wbuf.base, wbuf.off);
+        flush_pending_ssl(sock, next_cb);
+    } else if (!ret) {
+        h2o_socket_read_start(sock, next_cb);
+    }
+}
 
 static void proceed_handshake_picotls(h2o_socket_t *sock)
 {
@@ -1315,6 +1441,27 @@ static void proceed_handshake_undetermined(h2o_socket_t *sock)
     ptls_buffer_t wbuf;
     ptls_buffer_init(&wbuf, "", 0);
 
+    //TODO(mp): Try rapido, if no TCPLS TLS extension, fallback to the rest of the code
+    h2o_loop_t *loop = h2o_socket_get_loop(sock);
+    if (loop->server == NULL) {
+        loop->server = rapido_new_server(ptls_ctx, "TODO(mp)", stderr);
+        if (loop->server == NULL)
+            h2o_fatal("no memory");
+    }
+    sock->ssl->rapido.status = rapido_handshake_pending;
+    ptls_t *ptls = ptls_new(ptls_ctx, true);
+    *ptls_get_data_ptr(ptls) = sock;
+    rapido_server_add_new_connection(&loop->server->pending_connections, ptls_ctx, ptls, "TODO(mp)", h2o_socket_get_fd(sock), 0 /* TODO local_address_id*/);
+    rapido_session_t *session = NULL;
+    rapido_server_process_handshake(loop->server, NULL, &loop->server->pending_connections, 0 /* TODO pending_connection_index*/, (uint8_t *) sock->ssl->input.encrypted->bytes, &consumed, &wbuf, &session, NULL);
+    int ret = PTLS_ERROR_IN_PROGRESS; //TODO(mp)
+    if (session) {
+        sock->ssl->rapido.session = session;
+        ret = 0;
+    }
+    
+
+#ifdef NO_RAPIDO
 #if PICOTLS_USE_DTRACE
     unsigned ptls_skip_tracing_backup = ptls_default_skip_tracing;
     ptls_default_skip_tracing = sock->_skip_tracing;
@@ -1327,6 +1474,7 @@ static void proceed_handshake_undetermined(h2o_socket_t *sock)
         h2o_fatal("no memory");
     *ptls_get_data_ptr(ptls) = sock;
     int ret = ptls_handshake(ptls, &wbuf, sock->ssl->input.encrypted->bytes, &consumed, NULL);
+#endif
 
     if (ret == PTLS_ERROR_IN_PROGRESS && wbuf.off == 0) {
         /* we aren't sure if the picotls can process the handshake, retain handshake transcript and replay on next occasion */
@@ -1372,7 +1520,9 @@ static void proceed_handshake(h2o_socket_t *sock, const char *err)
         return;
     }
 
-    if (sock->ssl->ptls != NULL) {
+    if (sock->ssl->rapido.status == rapido_handshake_pending) {
+        proceed_handshake_tcpls(sock);
+    } else if (sock->ssl->ptls != NULL) {
         proceed_handshake_picotls(sock);
     } else if (sock->ssl->ossl != NULL) {
         proceed_handshake_openssl(sock);

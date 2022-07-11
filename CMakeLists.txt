@@ -368,6 +368,7 @@ SET(LIB_SOURCE_FILES
     deps/picotls/lib/certificate_compression.c
     deps/picotls/lib/pembase64.c
     deps/picotls/lib/picotls.c
+    deps/picotls/lib/rapido.c
     deps/picotls/lib/openssl.c
     deps/picotls/lib/cifra/random.c
     deps/picotls/lib/cifra/x25519.c
