@@ -48,7 +48,13 @@ typedef struct st_h2o_evloop_t {
     struct timeval _tv_at;
     h2o_timerwheel_t *_timeouts;
     h2o_sliding_counter_t exec_time_nanosec_counter;
-    rapido_server_t *server;
+    struct {
+        rapido_server_t *server;
+        H2O_VECTOR(struct {
+            struct sockaddr_storage sa;
+            socklen_t sa_len;
+        }) addresses_to_advertise;
+    } rapido;
 } h2o_evloop_t;
 
 typedef h2o_evloop_t h2o_loop_t;

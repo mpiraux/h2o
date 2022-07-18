@@ -74,6 +74,7 @@ struct st_h2o_socket_ssl_t {
         } status;
         rapido_session_t *session;
         rapido_connection_id_t connection_id;
+        size_t pending_connection_index;
     } rapido;
     int *did_write_in_read; /* used for detecting and closing the connection upon renegotiation (FIXME implement renegotiation) */
     size_t record_overhead;
@@ -310,7 +311,7 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
     assert(sock->ssl->rapido.status == rapido_handshake_done);
     assert(sock->ssl->handshake.cb == NULL);
 
-    rapido_server_t *server = h2o_socket_get_loop(sock)->server;
+    rapido_server_t *server = h2o_socket_get_loop(sock)->rapido.server;
 
     if (sock->ssl->rapido.session != NULL) {
         if (sock->ssl->input.encrypted->size != 0) {
@@ -332,6 +333,7 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
                     size_t read_len = UINT64_MAX;
                     uint8_t *stream_data = rapido_read_stream(session, notification->stream_id, &read_len);
                     if (read_len > 0) {
+                         // TODO(mp) It should end up in the session master socket to keep the same HTTP context.
                         if ((reserved = h2o_buffer_try_reserve(&sock->input, read_len)).base == NULL)
                             return h2o_socket_error_out_of_memory;
                         memcpy(reserved.base, stream_data, read_len);
@@ -361,10 +363,12 @@ static void clear_output_buffer(struct st_h2o_socket_ssl_t *ssl)
 static void destroy_ssl(struct st_h2o_socket_ssl_t *ssl)
 {
     if (ssl->rapido.session != NULL) {
-        rapido_array_iter(&ssl->rapido.session->connections, i, rapido_connection_t *connection, {
-            connection->socket = -1;
-        });
-        rapido_session_free(ssl->rapido.session);
+        if (ssl->rapido.connection_id == 0) {
+            rapido_array_iter(&ssl->rapido.session->connections, i, rapido_connection_t *connection, {
+                connection->socket = -1;
+            });
+            rapido_session_free(ssl->rapido.session);
+        }
         ssl->rapido.session = NULL;
         ssl->ptls = NULL;
     } else if (ssl->ptls != NULL) {
@@ -1239,11 +1243,11 @@ static void proceed_handshake_tcpls(h2o_socket_t *sock)
     ptls_buffer_t wbuf;
     ptls_buffer_init(&wbuf, "", 0);
 
-    rapido_server_t *server = h2o_socket_get_loop(sock)->server;
+    rapido_server_t *server = h2o_socket_get_loop(sock)->rapido.server;
     
     rapido_session_t *session = sock->ssl->rapido.session;
     rapido_connection_t *connection = NULL;
-    rapido_server_process_handshake(server, NULL, &server->pending_connections, 0 /* TODO pending_connection_index*/, (uint8_t *) src, &consumed, &wbuf, &session, &connection);
+    rapido_server_process_handshake(server, NULL, &server->pending_connections, sock->ssl->rapido.pending_connection_index, (uint8_t *) src, &consumed, &wbuf, &session, &connection);
     if (wbuf.off > 0) {
         h2o_socket_read_stop(sock);
         write_ssl_bytes(sock, wbuf.base, wbuf.off);
@@ -1254,6 +1258,10 @@ static void proceed_handshake_tcpls(h2o_socket_t *sock)
     }
     if (session != NULL && ptls_handshake_is_complete(session->tls)) {
         sock->ssl->rapido.status = rapido_handshake_done;
+    }
+    if ((connection != NULL && connection->connection_id > 0)) {
+        sock->ssl->rapido.status = rapido_handshake_done;
+        sock->ssl->ptls = connection->tls;
     }
     if (connection) {
         sock->ssl->rapido.connection_id = connection->connection_id;
@@ -1441,19 +1449,40 @@ static void proceed_handshake_undetermined(h2o_socket_t *sock)
     ptls_buffer_t wbuf;
     ptls_buffer_init(&wbuf, "", 0);
 
+#define SOCKADDR_ADDR(a)                                                                                                           \
+    (((struct sockaddr *)(a))->sa_family == AF_INET ? (void *)&((struct sockaddr_in *)(a))->sin_addr                               \
+                                                    : (void *)&((struct sockaddr_in6 *)(a))->sin6_addr)
+#define SOCKADDR_PORT(a)                                                                                                           \
+    (((struct sockaddr *)(a))->sa_family == AF_INET ? &((struct sockaddr_in *)(a))->sin_port                                       \
+                                                    : &((struct sockaddr_in6 *)(a))->sin6_port)
+
     //TODO(mp): Try rapido, if no TCPLS TLS extension, fallback to the rest of the code
     h2o_loop_t *loop = h2o_socket_get_loop(sock);
-    if (loop->server == NULL) {
-        loop->server = rapido_new_server(ptls_ctx, "TODO(mp)", stderr);
-        if (loop->server == NULL)
+    if (loop->rapido.server == NULL) {
+        loop->rapido.server = rapido_new_server(ptls_ctx, "TODO(mp)", stderr);
+        if (loop->rapido.server == NULL)
             h2o_fatal("no memory");
+        struct sockaddr_storage sockname;
+        h2o_socket_getsockname(sock, (struct sockaddr *) &sockname);
+        for (int i = 0; i < loop->rapido.addresses_to_advertise.size; i++) {
+            if (h2o_socket_compare_address((struct sockaddr *) &sockname, (struct sockaddr *) &loop->rapido.addresses_to_advertise.entries[i].sa, 1) == 0) {
+                rapido_add_server_address(loop->rapido.server, (struct sockaddr *) &loop->rapido.addresses_to_advertise.entries[i].sa, loop->rapido.addresses_to_advertise.entries[i].sa_len, false);
+                break;
+            }
+        }
+        for (int i = 0; i < loop->rapido.addresses_to_advertise.size; i++) {
+            if (h2o_socket_compare_address((struct sockaddr *) &sockname, (struct sockaddr *) &loop->rapido.addresses_to_advertise.entries[i].sa, 1) != 0) {
+                rapido_add_server_address(loop->rapido.server, (struct sockaddr *) &loop->rapido.addresses_to_advertise.entries[i].sa, loop->rapido.addresses_to_advertise.entries[i].sa_len, false);
+            }
+        }
     }
     sock->ssl->rapido.status = rapido_handshake_pending;
     ptls_t *ptls = ptls_new(ptls_ctx, true);
     *ptls_get_data_ptr(ptls) = sock;
-    rapido_server_add_new_connection(&loop->server->pending_connections, ptls_ctx, ptls, "TODO(mp)", h2o_socket_get_fd(sock), 0 /* TODO local_address_id*/);
+    sock->ssl->rapido.pending_connection_index = rapido_server_add_new_connection(&loop->rapido.server->pending_connections, ptls_ctx, ptls, "TODO(mp)", h2o_socket_get_fd(sock), 0 /* TODO local_address_id*/);
+    printf("loop->rapido.server: %p, pending_connection_index: %d\n", loop->rapido.server, sock->ssl->rapido.pending_connection_index);
     rapido_session_t *session = NULL;
-    rapido_server_process_handshake(loop->server, NULL, &loop->server->pending_connections, 0 /* TODO pending_connection_index*/, (uint8_t *) sock->ssl->input.encrypted->bytes, &consumed, &wbuf, &session, NULL);
+    rapido_server_process_handshake(loop->rapido.server, NULL, &loop->rapido.server->pending_connections, sock->ssl->rapido.pending_connection_index, (uint8_t *) sock->ssl->input.encrypted->bytes, &consumed, &wbuf, &session, NULL);
     int ret = PTLS_ERROR_IN_PROGRESS; //TODO(mp)
     if (session) {
         sock->ssl->rapido.session = session;

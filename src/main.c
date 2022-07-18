@@ -257,6 +257,13 @@ static struct {
     char *crash_handler;
     int crash_handler_wait_pipe_close;
     int tcp_reuseport;
+    struct {
+        /* List of addresses to advertise with rapido */
+        H2O_VECTOR(struct {
+            struct sockaddr_storage sa;
+            socklen_t sa_len;
+        }) addresses_to_advertise;
+    } rapido;
 #ifdef LIBCAP_FOUND
     H2O_VECTOR(cap_value_t) capabilities;
 #endif
@@ -281,6 +288,7 @@ static struct {
     .crash_handler = "share/h2o/annotate-backtrace-symbols",
     .crash_handler_wait_pipe_close = 0,
     .tcp_reuseport = 0,
+    .rapido = {0},
 };
 
 static __thread size_t thread_index;
@@ -1908,6 +1916,59 @@ static int on_config_listen_exit(h2o_configurator_t *_configurator, h2o_configur
     return 0;
 }
 
+
+static int on_config_rapido(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    switch (node->type) {
+    case YOML_TYPE_MAPPING: {
+        yoml_t **addresses_to_advertise = NULL;
+        if (h2o_configurator_parse_mapping(cmd, node, "addresses_to_advertise:a", NULL, &addresses_to_advertise) != 0)
+            return -1;
+        node = *addresses_to_advertise;
+        if (node->type == YOML_TYPE_SEQUENCE) {
+            h2o_vector_reserve(NULL, &conf.rapido.addresses_to_advertise, node->data.sequence.size);
+            for (size_t i = 0; i != node->data.sequence.size; ++i) {
+                yoml_t *element = node->data.sequence.elements[i];
+                if (element->type == YOML_TYPE_MAPPING) {
+                    yoml_t **address = NULL, **port = NULL;
+                    if (h2o_configurator_parse_mapping(cmd, element, "address:s,port:s", NULL, &address, &port) != 0)
+                        return -1;
+                    struct addrinfo *ai = NULL;
+                    if ((ai = resolve_address(cmd, element, SOCK_STREAM, IPPROTO_TCP, (*address)->data.scalar, (*port)->data.scalar)) == NULL)
+                        return -1;
+                    memcpy(&conf.rapido.addresses_to_advertise.entries[i].sa, ai->ai_addr, ai->ai_addrlen);
+                    conf.rapido.addresses_to_advertise.entries[i].sa_len = ai->ai_addrlen;
+                    conf.rapido.addresses_to_advertise.size++;
+                    freeaddrinfo(ai);
+                } else {
+                    h2o_configurator_errprintf(cmd, element, "value must a mapping (with keys: `address` and `port`)");
+                    return -1;
+                }
+            }
+            conf.rapido.addresses_to_advertise.size = node->data.sequence.size;
+        } else {
+            h2o_configurator_errprintf(cmd, node, "value must a sequence");
+            return -1;
+        }
+    } break;
+    default:
+        h2o_configurator_errprintf(cmd, node, "value must or a mapping (with key: `addresses_to_advertise`)");
+        return -1;
+    }
+    return 0;
+}
+
+static int on_config_rapido_enter(h2o_configurator_t *_configurator, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return 0;
+}
+
+static int on_config_rapido_exit(h2o_configurator_t *_configurator, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    // TODO(mp)
+    return 0;
+}
+
 static int on_config_user(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
     errno = 0;
@@ -2936,6 +2997,13 @@ static void *run_loop(void *_thread_index)
 #endif
     }
 
+    h2o_vector_reserve(NULL, &conf.threads[thread_index].ctx.loop->rapido.addresses_to_advertise, conf.rapido.addresses_to_advertise.size);
+    for (i = 0; i < conf.rapido.addresses_to_advertise.size; i++) {
+        conf.threads[thread_index].ctx.loop->rapido.addresses_to_advertise.entries[i].sa = conf.rapido.addresses_to_advertise.entries[i].sa;
+        conf.threads[thread_index].ctx.loop->rapido.addresses_to_advertise.entries[i].sa_len = conf.rapido.addresses_to_advertise.entries[i].sa_len;
+        conf.threads[thread_index].ctx.loop->rapido.addresses_to_advertise.size++;
+    }
+
     /* setup listeners */
     for (i = 0; i != conf.num_listeners; ++i) {
         struct listener_config_t *listener_config = conf.listeners[i];
@@ -3271,6 +3339,13 @@ static void setup_configurators(void)
         c->enter = on_config_listen_enter;
         c->exit = on_config_listen_exit;
         h2o_configurator_define_command(c, "listen", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_HOST, on_config_listen);
+    }
+
+    {
+        h2o_configurator_t *c = h2o_configurator_create(&conf.globalconf, sizeof(*c));
+        c->enter = on_config_rapido_enter;
+        c->exit = on_config_rapido_exit;
+        h2o_configurator_define_command(c, "rapido", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_HOST, on_config_rapido);
     }
 
     {
