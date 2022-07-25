@@ -245,10 +245,16 @@ static void read_on_ready(struct st_h2o_evloop_socket_t *sock)
 
     if (sock->super.ssl != NULL && sock->super.ssl->handshake.cb == NULL) {
         if (sock->super.ssl->rapido.session != NULL) {
-            err = decode_tcpls_input(&sock->super, h2o_now(sock->loop));
+            err = decode_tcpls_input(&sock->super, h2o_now(sock->loop) / 1000);
         } else {
             err = decode_ssl_input(&sock->super);
         }
+    }
+    
+    if (sock->super.ssl != NULL && sock->super.ssl->rapido.dont_deliver_received_data) {
+        printf("don't deliver data\n");
+        sock->super.bytes_read += sock->super.input->size - prev_size;
+        return;
     }
 
 Notify:
