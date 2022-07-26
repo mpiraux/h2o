@@ -799,22 +799,9 @@ void h2o_socket_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_
                 if (sock->ssl->rapido.status == rapido_handshake_done) {
                     // bufs[0].base + off, sz
                     int now = h2o_now(h2o_socket_get_loop(sock)) / 1000;
-                    rapido_attach_stream(sock->ssl->rapido.session, 0, 0);
-                    int all_blocked = 1;
-                    rapido_array_iter(&sock->ssl->rapido.session->connections, connection_id, rapido_connection_t *connection, {
-                        bool is_blocked = 0;
-                        rapido_connection_wants_to_send(sock->ssl->rapido.session, connection, now, &is_blocked);
-                        if (!is_blocked) {
-                            all_blocked = 0;
-                            break;
-                        }
-                    });
-                    if (!all_blocked) {
-                        rapido_add_to_stream(sock->ssl->rapido.session, 0, bufs[0].base + off, sz);
-                    } else {
-                        sock->bytes_written += sz;
-                        return;
-                    }
+                    rapido_attach_stream(sock->ssl->rapido.session, 0 /* TODO stream_id */, 0 /* TODO connection_id */);
+                    rapido_add_to_stream(sock->ssl->rapido.session, 0, bufs[0].base + off, sz);
+                    sock->bytes_written += sz;
                 } else if (sock->ssl->ptls != NULL) {
                     size_t dst_size = sz + ptls_get_record_overhead(sock->ssl->ptls);
                     void *dst = h2o_mem_alloc_pool(&sock->ssl->output.pool, char, dst_size);
@@ -908,6 +895,7 @@ void h2o_socket_read_start(h2o_socket_t *sock, h2o_socket_cb cb)
     do_read_start(sock);
     if (sock->ssl != NULL) {
         sock->ssl->rapido.dont_deliver_received_data = 0;
+        // TODO(mp) Check what needs to be delivered now
     }
 }
 
