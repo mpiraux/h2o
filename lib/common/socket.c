@@ -76,8 +76,8 @@ struct st_h2o_socket_ssl_t {
         rapido_connection_id_t connection_id;
         size_t pending_connection_index;
         int dont_deliver_received_data;
-        h2o_socket_cb write_cb;
-        size_t write_sz;
+        int data_arrived;
+        h2o_socket_cb resume_writing_cb;
     } rapido;
     int *did_write_in_read; /* used for detecting and closing the connection upon renegotiation (FIXME implement renegotiation) */
     size_t record_overhead;
@@ -159,8 +159,6 @@ const char h2o_socket_error_ssl_handshake[] = "ssl handshake failure";
 
 static void (*resumption_get_async)(h2o_socket_t *sock, h2o_iovec_t session_id);
 static void (*resumption_new)(h2o_socket_t *sock, h2o_iovec_t session_id, h2o_iovec_t session_data);
-
-static void h2o_socket_cb_noop(h2o_socket_t *sock, const char *err) {}
 
 static int read_bio(BIO *b, char *out, int len)
 {
@@ -322,6 +320,16 @@ static void clear_output_buffer(struct st_h2o_socket_ssl_t *ssl)
     h2o_mem_clear_pool(&ssl->output.pool);
 }
 
+static void h2o_socket_cb_rapido_clear_output_buffer(h2o_socket_t *sock, const char *err) {
+    clear_output_buffer(sock->ssl);
+}
+static void h2o_socket_cb_rapido_resume_write(h2o_socket_t *sock, const char *err) {
+    assert(sock->ssl->rapido.session != NULL);
+    assert(sock->ssl->rapido.resume_writing_cb != NULL);
+    h2o_socket_notify_write(rapido_connection_get_app_ptr(sock->ssl->rapido.session, 0 /* TODO connection_id */), sock->ssl->rapido.resume_writing_cb);
+    sock->ssl->rapido.resume_writing_cb = NULL;
+}
+
 const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
     assert(sock->ssl != NULL);
     assert(sock->ssl->rapido.status == rapido_handshake_done);
@@ -336,6 +344,15 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
             size_t consumed = src_end - src;
             rapido_session_t *session = sock->ssl->rapido.session;
 
+            uint64_t connections_blocked = 0;
+            rapido_array_iter(&session->connections, connection_id, rapido_connection_t *connection, {
+                bool is_blocked = 0;
+                rapido_connection_wants_to_send(session, connection, current_time, &is_blocked);
+                if (is_blocked) {
+                    SET_ADD(connections_blocked, connection_id);
+                }
+            });
+
             // TODO(mp): Handle decode error
             if (sock->ssl->rapido.status == rapido_handshake_done) {
                 rapido_process_incoming_data(session, sock->ssl->rapido.connection_id, current_time, (uint8_t *) src, &consumed);
@@ -343,16 +360,14 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
                 h2o_buffer_consume(&sock->ssl->input.encrypted, sock->ssl->input.encrypted->size - (src_end - src));
             }           
 
-            rapido_application_notification_t *notification = NULL;
-            while (session->pending_notifications.size > 0) {
-                notification = (rapido_application_notification_t *) rapido_queue_pop(&session->pending_notifications);
+            rapido_queue_drain(&session->pending_notifications, rapido_application_notification_t *notification, {
+                assert(notification->notification_type != rapido_stream_data_was_written);
                 if (notification->notification_type == rapido_stream_has_data) {
                     size_t read_len = UINT64_MAX;
                     uint8_t *stream_data = rapido_read_stream(session, notification->stream_id, &read_len);
                     if (read_len > 0) {
                         h2o_socket_t *master_sock = rapido_connection_get_app_ptr(session, 0 /*TODO connection_id*/);
                         size_t prev_size = master_sock->input->size;
-                         // TODO(mp) It should end up in the session master socket to keep the same HTTP context.
                         if ((reserved = h2o_buffer_try_reserve(&master_sock->input, read_len)).base == NULL)
                             return h2o_socket_error_out_of_memory;
                         memcpy(reserved.base, stream_data, read_len);
@@ -363,36 +378,72 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
                         }
                     }
                 }
-            }
+            });
 
-            rapido_array_iter(&session->connections, connection_id, rapido_connection_t* connection, {
-                if (rapido_connection_wants_to_send(session, connection, current_time, NULL)) {
-                    h2o_socket_t *conn_sock = (h2o_socket_t *) rapido_connection_get_app_ptr(sock->ssl->rapido.session, connection->connection_id);
-                    size_t total_sz = sock->ssl->rapido.write_sz;
-                    size_t dst_size = 16384 + (2 * total_sz);
-                    void *dst = h2o_mem_alloc_pool(&conn_sock->ssl->output.pool, char, dst_size);
-                    rapido_prepare_data(session, connection->connection_id, current_time, dst, &dst_size);
-                    h2o_vector_reserve(&conn_sock->ssl->output.pool, &conn_sock->ssl->output.bufs, conn_sock->ssl->output.bufs.size + 1);
-                    conn_sock->ssl->output.bufs.entries[conn_sock->ssl->output.bufs.size++] = h2o_iovec_init(dst, dst_size);
-                    bool is_blocked = 0;
-                    int more_to_send = rapido_connection_wants_to_send(session, connection, current_time, &is_blocked);
-                    if (!more_to_send) {
-                        if (!is_blocked) {
-                            flush_pending_ssl(conn_sock, sock->ssl->rapido.write_cb ? sock->ssl->rapido.write_cb : h2o_socket_cb_noop);
-                            if (sock->ssl->rapido.write_cb == NULL) {
-                                clear_output_buffer(conn_sock->ssl);
-                            } else {
-                                sock->_cb.write = sock->ssl->rapido.write_cb;
-                            }
-                            sock->ssl->rapido.write_cb = NULL;
-                            sock->ssl->rapido.write_sz = 0;
-                        } else {
-                            flush_pending_ssl(conn_sock, h2o_socket_cb_noop);
-                            clear_output_buffer(conn_sock->ssl);
-                        }
-                    }
+            size_t connections_unblocked = 0;
+            rapido_array_iter(&session->connections, connection_id, rapido_connection_t *connection, {
+                bool is_blocked = 0;
+                rapido_connection_wants_to_send(session, connection, current_time, &is_blocked);
+                if (!is_blocked && SET_HAS(connections_blocked, connection_id)) {
+                    SET_ADD(connections_unblocked, connection_id);
                 }
             });
+
+            if (SET_SIZE(connections_unblocked) > 0) {
+                uint64_t shortest_time_to_send = UINT64_MAX;
+                rapido_connection_id_t fastest_conn = 0;
+                h2o_socket_t *master_sock = (h2o_socket_t *) rapido_connection_get_app_ptr(sock->ssl->rapido.session, 0 /* TODO connection_id */);
+                
+                rapido_array_iter(&session->connections, connection_id, rapido_connection_t *connection, {
+                    if (!SET_HAS(connections_unblocked, connection_id)) {
+                        break;
+                    }
+                    rapido_attach_stream(sock->ssl->rapido.session, 0 /* TODO stream_id */, connection_id);
+                    if (rapido_connection_wants_to_send(session, connection, current_time, NULL)) {
+                        rapido_connection_info_t conn_info = { 0 };
+                        rapido_connection_get_info(session, connection_id, &conn_info);
+                        uint64_t time_to_send = rapido_time_to_transfer(conn_info, 0 /*TODO bytes_len*/);
+                        if (time_to_send < shortest_time_to_send) {
+                            shortest_time_to_send = time_to_send;
+                            fastest_conn = connection_id;
+                        }
+                    }
+                    rapido_detach_stream(sock->ssl->rapido.session, 0 /* TODO stream_id */, connection_id);
+                });
+                rapido_attach_stream(session, 0 /* TODO stream_id */, fastest_conn);
+                rapido_array_iter(&session->connections, connection_id, rapido_connection_t* connection, {
+                    if (!SET_HAS(connections_unblocked, connection_id)) {
+                        break;
+                    }
+                    if (rapido_connection_wants_to_send(session, connection, current_time, NULL)) {
+                        h2o_socket_t *conn_sock = (h2o_socket_t *) rapido_connection_get_app_ptr(sock->ssl->rapido.session, connection->connection_id);
+                        if (((struct st_h2o_evloop_socket_t *) conn_sock)->_wreq.cnt != 0) { /*There is a write still pending. */
+                            continue;
+                        }
+                        size_t dst_size = 5 * 16384;
+                        void *dst = h2o_mem_alloc_pool(&conn_sock->ssl->output.pool, char, dst_size);
+                        rapido_prepare_data(session, connection->connection_id, current_time, dst, &dst_size);
+                        h2o_vector_reserve(&conn_sock->ssl->output.pool, &conn_sock->ssl->output.bufs, conn_sock->ssl->output.bufs.size + 1);
+                        conn_sock->ssl->output.bufs.entries[conn_sock->ssl->output.bufs.size++] = h2o_iovec_init(dst, dst_size);
+                        bool is_blocked = 0;
+                        int more_to_send = rapido_connection_wants_to_send(session, connection, current_time, &is_blocked);
+                        if (!more_to_send || is_blocked) {
+                            assert(conn_sock->_cb.write == NULL || conn_sock->_cb.write == h2o_socket_cb_rapido_clear_output_buffer);
+                            conn_sock->_cb.write = NULL;
+                            flush_pending_ssl(conn_sock, h2o_socket_cb_rapido_clear_output_buffer);
+                        }
+                    }
+                });
+                rapido_detach_stream(session, 0 /* TODO stream_id */, fastest_conn);
+
+                rapido_queue_drain(&session->pending_notifications, rapido_application_notification_t *notification, {
+                    assert(notification->notification_type == rapido_stream_data_was_written);
+                    if (master_sock->_cb.write == NULL || master_sock->_cb.write == h2o_socket_cb_rapido_clear_output_buffer) {
+                        master_sock->_cb.write = NULL;
+                        h2o_socket_notify_write(master_sock, notification->app_ctx);
+                    }
+                });
+            }
         }
         return NULL;
     }
@@ -798,10 +849,13 @@ void h2o_socket_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_
                 total_sz += sz;
                 if (sock->ssl->rapido.status == rapido_handshake_done) {
                     // bufs[0].base + off, sz
-                    int now = h2o_now(h2o_socket_get_loop(sock)) / 1000;
-                    rapido_attach_stream(sock->ssl->rapido.session, 0 /* TODO stream_id */, 0 /* TODO connection_id */);
-                    rapido_add_to_stream(sock->ssl->rapido.session, 0, bufs[0].base + off, sz);
-                    sock->bytes_written += sz;
+                    // TODO(mp): Put backpressure on the server to stop receiving new data to send when blocked
+                    int now = h2o_now(h2o_socket_get_loop(sock)) / 1000; 
+                    if (bufcnt > 1) {
+                        rapido_add_to_stream(sock->ssl->rapido.session, 0, bufs[0].base + off, sz);
+                    } else {
+                        rapido_add_to_stream_notify(sock->ssl->rapido.session, 0, bufs[0].base + off, sz, cb);
+                    }
                 } else if (sock->ssl->ptls != NULL) {
                     size_t dst_size = sz + ptls_get_record_overhead(sock->ssl->ptls);
                     void *dst = h2o_mem_alloc_pool(&sock->ssl->output.pool, char, dst_size);
@@ -841,12 +895,33 @@ void h2o_socket_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_
             // TODO(mp): Make a smarter guess on what buffer size is required to send sz bytes
             uint64_t now = h2o_now_nanosec(h2o_socket_get_loop(sock)) / 1000;
             rapido_session_t *session = sock->ssl->rapido.session;
+            h2o_socket_t *master_sock = (h2o_socket_t *) rapido_connection_get_app_ptr(sock->ssl->rapido.session, 0 /* TODO connection_id */);
             int will_send_more_data = 1;
             while (will_send_more_data) {
                 will_send_more_data = 0;
-                rapido_array_iter(&session->connections, i, rapido_connection_t *connection, {
+                uint64_t shortest_time_to_send = UINT64_MAX;
+                rapido_connection_id_t fastest_conn = 0;
+                rapido_array_iter(&session->connections, connection_id, rapido_connection_t *connection, {
+                    rapido_attach_stream(sock->ssl->rapido.session, 0 /* TODO stream_id */, connection_id);
+                    if (rapido_connection_wants_to_send(session, connection, now, NULL)) {
+                        rapido_connection_info_t conn_info = { 0 };
+                        rapido_connection_get_info(session, connection_id, &conn_info);
+                        uint64_t time_to_send = rapido_time_to_transfer(conn_info, 0 /*TODO bytes_len*/);
+                        if (time_to_send < shortest_time_to_send) {
+                            shortest_time_to_send = time_to_send;
+                            fastest_conn = connection_id;
+                        }
+                    }
+                     rapido_detach_stream(sock->ssl->rapido.session, 0 /* TODO stream_id */, connection_id);
+                });
+                rapido_attach_stream(session, 0 /* TODO stream_id */, fastest_conn);
+                rapido_array_iter(&session->connections, connection_id, rapido_connection_t *connection, {
                     if (rapido_connection_wants_to_send(session, connection, now, NULL)) {
                         h2o_socket_t *conn_sock = (h2o_socket_t *) rapido_connection_get_app_ptr(sock->ssl->rapido.session, connection->connection_id);
+                        struct st_h2o_evloop_socket_t *ev_sock = (struct st_h2o_evloop_socket_t *) conn_sock;
+                        if (ev_sock->_wreq.cnt != 0) { /*There is a write still pending. */
+                            continue;
+                        }
                         size_t dst_size = 16384 + (2 * total_sz);
                         void *dst = h2o_mem_alloc_pool(&conn_sock->ssl->output.pool, char, dst_size);
                         rapido_prepare_data(session, connection->connection_id, now, dst, &dst_size);
@@ -854,21 +929,33 @@ void h2o_socket_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_
                         conn_sock->ssl->output.bufs.entries[conn_sock->ssl->output.bufs.size++] = h2o_iovec_init(dst, dst_size);
                         bool is_blocked = 0;
                         int more_to_send = rapido_connection_wants_to_send(session, connection, now, &is_blocked);
-                        if (!more_to_send) {
-                            if (!is_blocked) {
-                                sock->_cb.write = NULL;
-                                flush_pending_ssl(conn_sock, cb);
-                            } else {
-                                flush_pending_ssl(conn_sock, h2o_socket_cb_noop);
-                                clear_output_buffer(conn_sock->ssl);
-                                sock->_cb.write = cb;
-                                sock->ssl->rapido.write_cb = cb;
-                                sock->ssl->rapido.write_sz = total_sz;
+                        if (!more_to_send || is_blocked) {
+                            assert(conn_sock->_cb.write == NULL || conn_sock->_cb.write == h2o_socket_cb_rapido_clear_output_buffer);
+                            conn_sock->_cb.write = NULL;
+                            flush_pending_ssl(conn_sock, h2o_socket_cb_rapido_clear_output_buffer);
+                            void *last_app_cb = NULL;
+                            rapido_queue_drain(&session->pending_notifications, rapido_application_notification_t *notification, {
+                                if (notification->notification_type == rapido_new_connection)
+                                    continue;
+                                assert(notification->notification_type == rapido_stream_data_was_written);
+                                last_app_cb = notification->app_ctx;
+                            });
+                            if (last_app_cb) {
+                                if (ev_sock->_wreq.cnt == 0) {
+                                    if (master_sock->_cb.write == NULL || master_sock->_cb.write == h2o_socket_cb_rapido_clear_output_buffer) {
+                                        master_sock->_cb.write = NULL;
+                                        h2o_socket_notify_write(master_sock, last_app_cb);
+                                    }
+                                } else if (conn_sock->_cb.write == NULL || conn_sock->_cb.write == h2o_socket_cb_rapido_clear_output_buffer) {
+                                    conn_sock->ssl->rapido.resume_writing_cb = last_app_cb;
+                                    conn_sock->_cb.write = h2o_socket_cb_rapido_resume_write;
+                                }
                             }
                         }
                         will_send_more_data |= more_to_send && !is_blocked;
                     }
                 });
+                rapido_detach_stream(session, 0 /* TODO stream_id*/, fastest_conn);
             }
         } else {
             /* write the TLS records */
@@ -894,8 +981,15 @@ void h2o_socket_read_start(h2o_socket_t *sock, h2o_socket_cb cb)
     sock->_cb.read = cb;
     do_read_start(sock);
     if (sock->ssl != NULL) {
+        if (sock->ssl->rapido.status == rapido_handshake_done && 
+            sock->ssl->rapido.connection_id == 0 && 
+            sock->ssl->rapido.dont_deliver_received_data &&
+            sock->ssl->rapido.data_arrived) {
+            // TODO(mp) Check whether it really needs to be called back
+            sock->_cb.read(sock, NULL);
+            sock->ssl->rapido.data_arrived = 0;    
+        }
         sock->ssl->rapido.dont_deliver_received_data = 0;
-        // TODO(mp) Check what needs to be delivered now
     }
 }
 
@@ -1332,6 +1426,7 @@ static void on_handshake_complete(h2o_socket_t *sock, const char *err)
     sock->ssl->handshake.cb = NULL;
     if (err == NULL) {
         if (sock->ssl->rapido.status > rapido_not_used) {
+            clear_output_buffer(sock->ssl);
             err = decode_tcpls_input(sock, h2o_now_nanosec(h2o_socket_get_loop(sock)) / 1000);
         } else {
             err = decode_ssl_input(sock);
@@ -1360,11 +1455,6 @@ static void proceed_handshake_tcpls(h2o_socket_t *sock)
     rapido_session_t *session = sock->ssl->rapido.session;
     rapido_connection_t *connection = NULL;
     rapido_server_process_handshake(server, NULL, &server->pending_connections, sock->ssl->rapido.pending_connection_index, (uint8_t *) src, &consumed, &wbuf, &session, &connection);
-    if (wbuf.off > 0) {
-        h2o_socket_read_stop(sock);
-        write_ssl_bytes(sock, wbuf.base, wbuf.off);
-    }
-    ptls_buffer_dispose(&wbuf);
     if (session) {
         sock->ssl->rapido.session = session;
     }
@@ -1397,6 +1487,7 @@ static void proceed_handshake_tcpls(h2o_socket_t *sock)
         h2o_socket_read_stop(sock);
         write_ssl_bytes(sock, wbuf.base, wbuf.off);
         flush_pending_ssl(sock, next_cb);
+        ptls_buffer_dispose(&wbuf);
     } else if (!ret) {
         h2o_socket_read_start(sock, next_cb);
     }
