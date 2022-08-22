@@ -707,6 +707,11 @@ void reqread_on_read(h2o_socket_t *sock, const char *err)
 
 static void on_timeout(struct st_h2o_http1_conn_t *conn)
 {
+    if (h2o_socket_is_tcpls_subflow(conn->sock)) {
+        close_connection(conn, 0);
+        return;
+    }
+
     if (conn->_req_index == 1) {
         /* assign hostconf and bind conf so that the request can be logged */
         h2o_hostconf_t *hostconf = h2o_req_setup(&conn->req);

@@ -963,6 +963,10 @@ const char *h2o_socket_get_ssl_protocol_version(h2o_socket_t *sock)
     return NULL;
 }
 
+int h2o_socket_is_tcpls_subflow(h2o_socket_t *sock) {
+    return sock->ssl && sock->ssl->rapido.connection_id > 0;
+}
+
 int h2o_socket_get_ssl_session_reused(h2o_socket_t *sock)
 {
     if (sock->ssl != NULL) {
