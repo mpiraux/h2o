@@ -611,7 +611,10 @@ void h2o_socket_close(h2o_socket_t *sock)
         // TODO(mp): Handle connection and session closure with TCPLS messages
         if (sock->ssl->rapido.connection_id == 0) {
             rapido_array_iter(&sock->ssl->rapido.session->connections, connection_id, rapido_connection_t *connection, {
-                if (connection_id != 0) {
+                if (connection_id == 0) {
+                    ptls_set_traffic_protection(sock->ssl->ptls, connection->encryption_ctx, 0);
+                    ptls_set_traffic_protection(sock->ssl->ptls, connection->decryption_ctx, 1);
+                } else if (connection->socket != -1) {
                     h2o_socket_t *conn_sock = (h2o_socket_t *) rapido_connection_get_app_ptr(sock->ssl->rapido.session, connection_id);
                     rapido_close_connection(conn_sock->ssl->rapido.session, conn_sock->ssl->rapido.connection_id);
                     conn_sock->ssl->rapido.status = rapido_not_used;
@@ -620,9 +623,9 @@ void h2o_socket_close(h2o_socket_t *sock)
                     conn_sock->ssl->ptls = NULL;
                     struct st_h2o_evloop_socket_t *evloop_sock = (struct st_h2o_evloop_socket_t *) conn_sock;
                     evloop_sock->fd = -1;
-                }   
+                }
             });
-            shutdown_ssl(sock, 0);
+            shutdown_ssl(sock, NULL);
         } else {
             rapido_close_connection(sock->ssl->rapido.session, sock->ssl->rapido.connection_id);
             sock->ssl->rapido.status = rapido_not_used;
@@ -631,7 +634,7 @@ void h2o_socket_close(h2o_socket_t *sock)
             sock->ssl->ptls = NULL;
             struct st_h2o_evloop_socket_t *evloop_sock = (struct st_h2o_evloop_socket_t *) sock;
             evloop_sock->fd = -1;
-            shutdown_ssl(sock, 0);
+            dispose_socket(sock, NULL);
         }
     } else {
         shutdown_ssl(sock, 0);
