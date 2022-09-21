@@ -396,7 +396,7 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
                 
                 rapido_array_iter(&session->connections, connection_id, rapido_connection_t *connection, {
                     if (!SET_HAS(connections_unblocked, connection_id)) {
-                        break;
+                        continue;
                     }
                     rapido_attach_stream(sock->ssl->rapido.session, 0 /* TODO stream_id */, connection_id);
                     if (rapido_connection_wants_to_send(session, connection, current_time, NULL)) {
@@ -413,7 +413,7 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
                 rapido_attach_stream(session, 0 /* TODO stream_id */, fastest_conn);
                 rapido_array_iter(&session->connections, connection_id, rapido_connection_t* connection, {
                     if (!SET_HAS(connections_unblocked, connection_id)) {
-                        break;
+                        continue;
                     }
                     if (rapido_connection_wants_to_send(session, connection, current_time, NULL)) {
                         h2o_socket_t *conn_sock = (h2o_socket_t *) rapido_connection_get_app_ptr(sock->ssl->rapido.session, connection->connection_id);
