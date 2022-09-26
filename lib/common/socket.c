@@ -1472,8 +1472,7 @@ static void proceed_handshake_tcpls(h2o_socket_t *sock)
         sock->ssl->rapido.status = rapido_handshake_done;
         rapido_connection_set_app_ptr(sock->ssl->rapido.session, sock->ssl->rapido.connection_id, sock);
     }
-    src += consumed;
-    h2o_buffer_consume(&sock->ssl->input.encrypted, sock->ssl->input.encrypted->size - (src_end - src));
+    h2o_buffer_consume(&sock->ssl->input.encrypted, consumed);
 
     h2o_socket_cb next_cb;
     if (sock->ssl->rapido.status == rapido_handshake_done) {
@@ -1491,8 +1490,10 @@ static void proceed_handshake_tcpls(h2o_socket_t *sock)
         write_ssl_bytes(sock, wbuf.base, wbuf.off);
         flush_pending_ssl(sock, next_cb);
         ptls_buffer_dispose(&wbuf);
-    } else if (!ret) {
+    } else if (sock->ssl->input.encrypted->size == 0) {
         h2o_socket_read_start(sock, next_cb);
+    } else if (next_cb == on_handshake_complete) {
+        on_handshake_complete(sock, NULL);
     }
 }
 
