@@ -1457,7 +1457,10 @@ static void proceed_handshake_tcpls(h2o_socket_t *sock)
     
     rapido_session_t *session = sock->ssl->rapido.session;
     rapido_connection_t *connection = NULL;
-    rapido_server_process_handshake(server, NULL, &server->pending_connections, sock->ssl->rapido.pending_connection_index, (uint8_t *) src, &consumed, &wbuf, &session, &connection);
+    int ret = rapido_server_process_handshake(server, NULL, &server->pending_connections, sock->ssl->rapido.pending_connection_index, (uint8_t *) src, &consumed, &wbuf, &session, &connection);
+    if (ret == -1) {
+        assert(false && "TODO(mp): Process fragmented handshake that should fallback\n");
+    }
     if (session) {
         sock->ssl->rapido.session = session;
     }
@@ -1481,7 +1484,7 @@ static void proceed_handshake_tcpls(h2o_socket_t *sock)
         next_cb = proceed_handshake;
     }
     //TODO(mp): Handle failure
-    int ret = 0;
+    ret = 0;
 
     /* When something is to be sent, send it and then take the next action. If there's nothing to be sent and the handshake is still
      * in progress, wait for more bytes to arrive; otherwise, take the action immediately. */
@@ -1689,13 +1692,23 @@ static void proceed_handshake_undetermined(h2o_socket_t *sock)
     *ptls_get_data_ptr(ptls) = sock;
     sock->ssl->rapido.pending_connection_index = rapido_server_add_new_connection(&loop->rapido.server->pending_connections, ptls_ctx, ptls, "TODO(mp)", h2o_socket_get_fd(sock), 0 /* TODO local_address_id*/);
     rapido_session_t *session = NULL;
-    rapido_server_process_handshake(loop->rapido.server, NULL, &loop->rapido.server->pending_connections, sock->ssl->rapido.pending_connection_index, (uint8_t *) sock->ssl->input.encrypted->bytes, &consumed, &wbuf, &session, NULL);
-    int ret = PTLS_ERROR_IN_PROGRESS; //TODO(mp)
-    if (session) {
+    int ret = rapido_server_process_handshake(loop->rapido.server, NULL, &loop->rapido.server->pending_connections, sock->ssl->rapido.pending_connection_index, (uint8_t *) sock->ssl->input.encrypted->bytes, &consumed, &wbuf, &session, NULL);
+
+    if (ret == -1) {
+        sock->ssl->rapido.status = rapido_not_used;
+        sock->ssl->rapido.pending_connection_index = 0;
+        size_t consumed = sock->ssl->input.encrypted->size;
+        ptls_buffer_dispose(&wbuf);
+        ptls_buffer_init(&wbuf, "", 0);
+        ptls_free(ptls);
+        ptls = ptls_new(ptls_ctx, true);
+        *ptls_get_data_ptr(ptls) = sock;
+        ret = ptls_handshake(ptls, &wbuf, sock->ssl->input.encrypted->bytes, &consumed, NULL);
+    } else if (session) {
         sock->ssl->rapido.session = session;
-        ret = 0;
+    } else {
+        ret = PTLS_ERROR_IN_PROGRESS;
     }
-    
 
 #ifdef NO_RAPIDO
 #if PICOTLS_USE_DTRACE
