@@ -344,12 +344,12 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
             size_t consumed = src_end - src;
             rapido_session_t *session = sock->ssl->rapido.session;
 
-            uint64_t connections_blocked = 0;
+            rapido_set_t connections_blocked = { 0 };
             rapido_array_iter(&session->connections, connection_id, rapido_connection_t *connection, {
                 bool is_blocked = 0;
                 rapido_connection_wants_to_send(session, connection, current_time, &is_blocked);
                 if (is_blocked) {
-                    SET_ADD(connections_blocked, connection_id);
+                    rapido_set_add(&connections_blocked, connection_id);
                 }
             });
 
@@ -380,22 +380,22 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
                 }
             });
 
-            size_t connections_unblocked = 0;
+            rapido_set_t connections_unblocked = { 0 };
             rapido_array_iter(&session->connections, connection_id, rapido_connection_t *connection, {
                 bool is_blocked = 0;
                 rapido_connection_wants_to_send(session, connection, current_time, &is_blocked);
-                if (!is_blocked && SET_HAS(connections_blocked, connection_id)) {
-                    SET_ADD(connections_unblocked, connection_id);
+                if (!is_blocked && rapido_set_has(&connections_blocked, connection_id)) {
+                    rapido_set_add(&connections_unblocked, connection_id);
                 }
             });
 
-            if (SET_SIZE(connections_unblocked) > 0) {
+            if (rapido_set_size(&connections_unblocked) > 0) {
                 uint64_t shortest_time_to_send = UINT64_MAX;
                 rapido_connection_id_t fastest_conn = 0;
                 h2o_socket_t *master_sock = (h2o_socket_t *) rapido_connection_get_app_ptr(sock->ssl->rapido.session, 0 /* TODO connection_id */);
                 
                 rapido_array_iter(&session->connections, connection_id, rapido_connection_t *connection, {
-                    if (!SET_HAS(connections_unblocked, connection_id)) {
+                    if (!rapido_set_has(&connections_unblocked, connection_id)) {
                         continue;
                     }
                     rapido_attach_stream(sock->ssl->rapido.session, 0 /* TODO stream_id */, connection_id);
@@ -412,7 +412,7 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
                 });
                 rapido_attach_stream(session, 0 /* TODO stream_id */, fastest_conn);
                 rapido_array_iter(&session->connections, connection_id, rapido_connection_t* connection, {
-                    if (!SET_HAS(connections_unblocked, connection_id)) {
+                    if (!rapido_set_has(&connections_unblocked, connection_id)) {
                         continue;
                     }
                     if (rapido_connection_wants_to_send(session, connection, current_time, NULL)) {
@@ -422,6 +422,7 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
                         }
                         size_t dst_size = 5 * 16384;
                         void *dst = h2o_mem_alloc_pool(&conn_sock->ssl->output.pool, char, dst_size);
+                        // TODO(mp): Not sure retransmission works in that case
                         rapido_prepare_data(session, connection->connection_id, current_time, dst, &dst_size);
                         h2o_vector_reserve(&conn_sock->ssl->output.pool, &conn_sock->ssl->output.bufs, conn_sock->ssl->output.bufs.size + 1);
                         conn_sock->ssl->output.bufs.entries[conn_sock->ssl->output.bufs.size++] = h2o_iovec_init(dst, dst_size);
