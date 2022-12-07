@@ -360,21 +360,22 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
                 h2o_buffer_consume(&sock->ssl->input.encrypted, sock->ssl->input.encrypted->size - (src_end - src));
             }           
 
+            h2o_socket_t *master_sock = rapido_connection_get_app_ptr(session, 0 /*TODO connection_id*/);
+            bool master_sock_should_read = false;
             rapido_queue_drain(&session->pending_notifications, rapido_application_notification_t *notification, {
                 assert(notification->notification_type != rapido_stream_data_was_written);
                 if (notification->notification_type == rapido_stream_has_data) {
                     size_t read_len = UINT64_MAX;
                     uint8_t *stream_data = rapido_read_stream(session, notification->stream_id, &read_len);
-                    if (read_len > 0) {
-                        h2o_socket_t *master_sock = rapido_connection_get_app_ptr(session, 0 /*TODO connection_id*/);
+                    if (stream_data && read_len > 0) {
                         size_t prev_size = master_sock->input->size;
                         if ((reserved = h2o_buffer_try_reserve(&master_sock->input, read_len)).base == NULL)
                             return h2o_socket_error_out_of_memory;
                         memcpy(reserved.base, stream_data, read_len);
                         master_sock->input->size += read_len;
                         if (master_sock != sock) {
+                            master_sock_should_read |= true;
                             master_sock->bytes_read += master_sock->input->size - prev_size;
-                            master_sock->_cb.read(master_sock, 0 /* TODO err*/);
                         }
                     }
                 }
@@ -392,7 +393,6 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
             if (rapido_set_size(&connections_unblocked) > 0) {
                 uint64_t shortest_time_to_send = UINT64_MAX;
                 rapido_connection_id_t fastest_conn = 0;
-                h2o_socket_t *master_sock = (h2o_socket_t *) rapido_connection_get_app_ptr(sock->ssl->rapido.session, 0 /* TODO connection_id */);
                 
                 rapido_array_iter(&session->connections, connection_id, rapido_connection_t *connection, {
                     if (!rapido_set_has(&connections_unblocked, connection_id)) {
@@ -444,6 +444,10 @@ const char *decode_tcpls_input(h2o_socket_t *sock, uint64_t current_time) {
                         h2o_socket_notify_write(master_sock, notification->app_ctx);
                     }
                 });
+            }
+
+            if (master_sock_should_read) {
+                master_sock->_cb.read(master_sock, 0 /* TODO err*/);
             }
         }
         return NULL;
