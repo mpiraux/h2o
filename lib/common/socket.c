@@ -858,7 +858,7 @@ void h2o_socket_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_
                 if (sock->ssl->rapido.status == rapido_handshake_done) {
                     // bufs[0].base + off, sz
                     // TODO(mp): Put backpressure on the server to stop receiving new data to send when blocked
-                    int now = h2o_now(h2o_socket_get_loop(sock)) / 1000; 
+                    int now = h2o_now_nanosec(h2o_socket_get_loop(sock)) / 1000; 
                     if (bufcnt > 1) {
                         rapido_add_to_stream(sock->ssl->rapido.session, 0, bufs[0].base + off, sz);
                     } else {

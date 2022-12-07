@@ -245,7 +245,7 @@ static void read_on_ready(struct st_h2o_evloop_socket_t *sock)
 
     if (sock->super.ssl != NULL && sock->super.ssl->handshake.cb == NULL) {
         if (sock->super.ssl->rapido.session != NULL) {
-            err = decode_tcpls_input(&sock->super, h2o_now(sock->loop) / 1000);
+            err = decode_tcpls_input(&sock->super, h2o_now_nanosec(sock->loop) / 1000);
         } else {
             err = decode_ssl_input(&sock->super);
         }
