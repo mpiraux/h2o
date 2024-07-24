@@ -621,6 +621,7 @@ void h2o_socket_close(h2o_socket_t *sock)
                     ptls_set_traffic_protection(sock->ssl->ptls, connection->decryption_ctx, 1);
                 } else if (connection->socket != -1) {
                     h2o_socket_t *conn_sock = (h2o_socket_t *) rapido_connection_get_app_ptr(sock->ssl->rapido.session, connection_id);
+                    assert(conn_sock && conn_sock->ssl);
                     rapido_close_connection(conn_sock->ssl->rapido.session, conn_sock->ssl->rapido.connection_id);
                     conn_sock->ssl->rapido.status = rapido_not_used;
                     conn_sock->ssl->rapido.session = NULL;
@@ -932,6 +933,9 @@ void h2o_socket_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_
                         }
                         size_t dst_size = 16384 + (2 * total_sz);
                         void *dst = h2o_mem_alloc_pool(&conn_sock->ssl->output.pool, char, dst_size);
+                        rapido_queue_drain(&session->pending_notifications, rapido_application_notification_t *notification, {
+                            assert(notification->notification_type == rapido_stream_data_was_written);
+                        });
                         rapido_prepare_data(session, connection->connection_id, now, dst, &dst_size);
                         h2o_vector_reserve(&conn_sock->ssl->output.pool, &conn_sock->ssl->output.bufs, conn_sock->ssl->output.bufs.size + 1);
                         conn_sock->ssl->output.bufs.entries[conn_sock->ssl->output.bufs.size++] = h2o_iovec_init(dst, dst_size);
@@ -940,7 +944,7 @@ void h2o_socket_write(h2o_socket_t *sock, h2o_iovec_t *bufs, size_t bufcnt, h2o_
                         if (!more_to_send || is_blocked) {
                             assert(conn_sock->_cb.write == NULL || conn_sock->_cb.write == h2o_socket_cb_rapido_clear_output_buffer);
                             conn_sock->_cb.write = NULL;
-                            flush_pending_ssl(conn_sock, h2o_socket_cb_rapido_clear_output_buffer);
+                            flush_pending_ssl(conn_sock, h2o_socket_cb_rapido_clear_output_buffer); // TODO: check that output buffer should be cleared no matter what
                             void *last_app_cb = NULL;
                             rapido_queue_drain(&session->pending_notifications, rapido_application_notification_t *notification, {
                                 if (notification->notification_type == rapido_new_connection)
@@ -1675,7 +1679,7 @@ static void proceed_handshake_undetermined(h2o_socket_t *sock)
     //TODO(mp): Try rapido, if no TCPLS TLS extension, fallback to the rest of the code
     h2o_loop_t *loop = h2o_socket_get_loop(sock);
     if (loop->rapido.server == NULL) {
-        loop->rapido.server = rapido_new_server(ptls_ctx, "TODO(mp)", stderr);
+        loop->rapido.server = rapido_new_server(ptls_ctx, "TODO(mp)", NULL);
         if (loop->rapido.server == NULL)
             h2o_fatal("no memory");
         struct sockaddr_storage sockname;
